@@ -105,10 +105,13 @@ static void bl_print(const char *msg)
     HAL_UART_Transmit(&huart3, (uint8_t *)"^^", 2, 50);
 }
 
+/*
 static int ota_slot_has_image(void)
 {
     return ((const ota_image_hdr_t *)OTA_START_ADDR)->magic == APP_MAGIC;
 }
+*/
+
 /* USER CODE END 0 */
 
 /**
@@ -187,10 +190,15 @@ Error_Handler();
 
   //HAL_UART_Transmit(&huart8, (uint8_t *)"Inside Bootloader!!\r\n", 21, 100);
 
-    if (check_ota_request() == 0 ||
-       (bootloader_is_app_valid() != 0 && ota_slot_has_image()))
+  int ota_flag_set = (check_ota_request() == 0);
+
+
+
+  if (ota_flag_set ||
+         (bootloader_is_app_valid() != 0 && bl_ota_check_slot() == 0))
     {
-    	bl_print("OTA Requested... Flashing..\r\n");
+	  bl_print(ota_flag_set ? "OTA Requested... Flashing..\r\n"
+	                        : "App invalid, slot valid: reinstalling..\r\n");
     	//HAL_UART_Transmit(&huart8, (uint8_t *)"OTA Requested... Flashing..\r\n", 29, 100);
 
         ota_stream_t stream =
@@ -205,13 +213,20 @@ Error_Handler();
 
         if (ota_stat != 0)
         {
-        	//HAL_UART_Transmit(&huart8, (uint8_t *)"OTA Failed!! ", 13, 100);
-        	bl_print("OTA Failed...\r\n");
-            //HAL_UART_Transmit(&huart2, (uint8_t *)"OTA Failed...\n", 14, 100);
-            while (1)
-            {
-            }
-        }
+			bl_print("OTA Failed!! \r\n");
+			switch (ota_stat)                                    /* Fix B: name the cause */
+			{
+			case -2: bl_print("SLOT MAGIC ERROR!!\r\n"); break;
+			case -3: bl_print("SLOT SIZE ERROR!!\r\n");  break;
+			case -7: bl_print("SLOT CRC ERROR!! Application not erased\r\n"); break;
+			case -5: bl_print("FLASH WRITE ERROR!!\r\n"); break;
+			case -6: bl_print("COPY CHECK ERROR!!\r\n");  break;
+			default: bl_print("SLOT READ ERROR!!\r\n");   break;   /* -1, -4 */
+			}
+			while (1)
+			{
+			}
+		}
         else
         {
         	//HAL_UART_Transmit(&huart8, (uint8_t *)"OTA Flashed Successfully, Jumping to app...\r\n", 45, 100);

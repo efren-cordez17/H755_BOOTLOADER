@@ -39,6 +39,7 @@ typedef struct
 } ota_stream_t;
 
 int bl_ota_run(bl_ota_ctx_t *ctx, ota_stream_t *stream);
+int bl_ota_check_slot(void);   /* 0 = complete image in the slot; -2 magic, -3 size, -7 CRC */
 void bl_flash_write_app_header(uint32_t magic, uint32_t size, uint32_t crc, uint32_t version);
 
 #endif /* INC_BL_OTA_H_ */

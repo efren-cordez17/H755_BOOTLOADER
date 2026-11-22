@@ -12,6 +12,8 @@
 #include "bl_ota.h"
 #include "app_header.h"
 #include "string.h"
+#include "crc32.h"
+
 
 
 #define OTA_FLAG_START		1
@@ -47,6 +49,25 @@ int check_ota_request (void)
 {
 	if (flash_read_ota_flag() == OTA_FLAG_START) return 0;
 	return 1;
+}
+
+/* Fix A: check the whole OTA slot in place, before anything is erased.
+   0 = complete image; -2 bad magic; -3 bad size; -7 CRC does not match. */
+int bl_ota_check_slot(void)
+{
+    const ota_image_hdr_t *slot = (const ota_image_hdr_t *)OTA_START_ADDR;
+
+    if (slot->magic != APP_MAGIC)
+        return -2;
+
+    if (slot->image_size == 0 || slot->image_size > APP_MAX_SIZE)
+        return -3;
+
+    if (crc32((const uint8_t *)(OTA_START_ADDR + sizeof(ota_image_hdr_t)),
+              slot->image_size) != slot->crc)
+        return -7;
+
+    return 0;
 }
 
 uint32_t bl_flash_erase_app (void)
@@ -150,6 +171,11 @@ int bl_ota_run(bl_ota_ctx_t *ctx, ota_stream_t *stream)
 
     if (hdr.image_size == 0 || hdr.image_size > APP_MAX_SIZE)
         return -3;
+
+    /* The whole slot must be good before bl_ota_begin() erases the application */
+    int slot_err = bl_ota_check_slot();
+    if (slot_err != 0)
+        return slot_err;
 
     /* Calculate total OTA image size */
     uint32_t total_size =
