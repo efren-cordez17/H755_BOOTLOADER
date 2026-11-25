@@ -12,11 +12,8 @@
 #include "bl_ota.h"
 #include "app_header.h"
 #include "string.h"
-#include "crc32.h"
-
-
-
-#define OTA_FLAG_START		1
+#include "bl_image.h"
+#include "bl_errors.h"
 
 #define CRC32_POLY 0xEDB88320
 
@@ -45,73 +42,56 @@ uint32_t bl_crc_finalize(uint32_t crc)
 	return crc ^ 0xFFFFFFFF;
 }
 
-int check_ota_request (void)
-{
-	if (flash_read_ota_flag() == OTA_FLAG_START) return 0;
-	return 1;
-}
 
 /* Fix A: check the whole OTA slot in place, before anything is erased.
-   0 = complete image; -2 bad magic; -3 bad size; -7 CRC does not match. */
+   Part 5: same check as every other image area (codes -10 to -13, see bl_image.h). */
 int bl_ota_check_slot(void)
 {
-    const ota_image_hdr_t *slot = (const ota_image_hdr_t *)OTA_START_ADDR;
-
-    if (slot->magic != APP_MAGIC)
-        return -2;
-
-    if (slot->image_size == 0 || slot->image_size > APP_MAX_SIZE)
-        return -3;
-
-    if (crc32((const uint8_t *)(OTA_START_ADDR + sizeof(ota_image_hdr_t)),
-              slot->image_size) != slot->crc)
-        return -7;
-
-    return 0;
+    return image_check(OTA_START_ADDR);
 }
 
-uint32_t bl_flash_erase_app (void)
+int bl_flash_erase_app (void)
 {
 	HAL_FLASH_Unlock();
-	uint32_t error = flash_erase_app();
+	int err = flash_erase_app();
 	HAL_FLASH_Lock();
-	return error;
+	return err;
 }
 
 
 
-void bl_ota_begin(bl_ota_ctx_t *ctx, uint32_t image_size, uint32_t expected_crc)
+int bl_ota_begin(bl_ota_ctx_t *ctx, uint32_t image_size, uint32_t expected_crc)
 {
-	bl_flash_erase_app();
+	if (bl_flash_erase_app() != BL_OK)
+		return BL_ERR_APP_ERASE;              // -8: the app area may be partly erased
 	ctx->write_addr     = APP_START_ADDR;
 	ctx->total_received = 0;
 	ctx->image_size     = image_size;
 	ctx->expected_crc   = expected_crc;
 	bl_crc_init(&ctx->running_crc);
+	return BL_OK;
 }
 
-void bl_flash_write_app_header(uint32_t magic, uint32_t size, uint32_t crc, uint32_t version)
-{
+
+
+int bl_flash_write_app_header(uint32_t magic, uint32_t size, uint32_t crc, uint32_t version){
 	app_header_t hdr;
+	int err = BL_OK;
 
-	hdr.ota_flag = 0;  // clear OTA FLAG
-	hdr.magic   = APP_MAGIC;
-	hdr.size    = size;
-	hdr.crc     = crc;
-	hdr.version = version;
-
+	hdr.ota_flag = 0;          // retired, always 0
+	hdr.magic    = APP_MAGIC;
+	hdr.size     = size;
+	hdr.crc      = crc;
+	hdr.version  = version;
+	memset(hdr.reserved, 0xFF, sizeof(hdr.reserved));
 
 	HAL_FLASH_Unlock();
-	/* Erase header page ONLY */
-	flash_erase_header();
-
-	/* Write header word by word */
-//	uint32_t *p = (uint32_t *)&hdr;
-//	uint32_t addr = APP_HEADER_ADDR;
-
-	memset(hdr.reserved, 0xFF, sizeof(hdr.reserved));
-	flash_write_flashword(APP_HEADER_ADDR, (const uint8_t *)&hdr);
+	if (flash_erase_header() != BL_OK)                                        // erases all of S1
+		err = BL_ERR_HDR_WRITE;
+	else if (flash_write_flashword(APP_HEADER_ADDR, (const uint8_t *)&hdr) != 0)
+		err = BL_ERR_HDR_WRITE;
 	HAL_FLASH_Lock();
+	return err;
 }
 
 int bl_ota_write_chunk(bl_ota_ctx_t *ctx, uint8_t *data, uint32_t len)
@@ -153,7 +133,8 @@ int bl_ota_finalize(bl_ota_ctx_t *ctx, ota_image_hdr_t *hdr)
 	}
 
 	/* Commit application */
-	bl_flash_write_app_header(hdr->magic, ctx->image_size, final_crc, hdr->version);
+	if (bl_flash_write_app_header(hdr->magic, ctx->image_size, final_crc, hdr->version) != BL_OK)
+		return BL_ERR_HDR_WRITE;              // -9: the copy was good, the header could not be written
 	return 0;
 }
 
@@ -185,8 +166,9 @@ int bl_ota_run(bl_ota_ctx_t *ctx, ota_stream_t *stream)
     if (stream->set_total_size)
         stream->set_total_size(total_size);
 
-    /* Start OTA */
-    bl_ota_begin(ctx, hdr.image_size, hdr.crc);
+    /* Start OTA: erases the application area */
+    if (bl_ota_begin(ctx, hdr.image_size, hdr.crc) != BL_OK)
+        return BL_ERR_APP_ERASE;
 
     /* Receive firmware payload */
     uint32_t remaining = hdr.image_size;
@@ -205,9 +187,49 @@ int bl_ota_run(bl_ota_ctx_t *ctx, ota_stream_t *stream)
         remaining -= len;
     }
 
-    /* Finalize OTA */
-    if (bl_ota_finalize(ctx, &hdr) != 0)
-        return -6;
+    /* Finalize OTA: CRC check of the copied bytes, then the new header */
+    int fin = bl_ota_finalize(ctx, &hdr);
+    if (fin == BL_ERR_HDR_WRITE)
+        return BL_ERR_HDR_WRITE;              // -9
+    if (fin != 0)
+        return -6;                            // copy check failed
 
     return 0;
+}
+
+
+/* ---- Slot reader: the install always reads from the OTA slot ------------- */
+/* Moved here from main.c 11-25. bl_ota_run() pulls bytes through these. */
+
+static uint32_t slot_cursor = 0;                         // next byte to read, from OTA_START_ADDR
+static uint32_t slot_total  = sizeof(ota_image_hdr_t);   // how far the reader may go
+
+static void slot_set_total_size(uint32_t size)
+{
+    slot_total = size;                                   // header + payload, set by bl_ota_run()
+}
+
+static int slot_read(uint8_t *buf, uint32_t len)
+{
+    if (slot_cursor + len > slot_total)
+        return -1;                                       // never read past the image
+
+    memcpy(buf, (const uint8_t *)(OTA_START_ADDR + slot_cursor), len);   // flash is memory-mapped
+    slot_cursor += len;
+    return 0;
+}
+
+int bl_ota_install_from_slot(void)
+{
+    ota_stream_t stream =
+    {
+        .read           = slot_read,
+        .set_total_size = slot_set_total_size
+    };
+    bl_ota_ctx_t ctx;
+
+    slot_cursor = 0;                          // start at the slot header, every time
+    slot_total  = sizeof(ota_image_hdr_t);    // only the header may be read until its size is known
+
+    return bl_ota_run(&ctx, &stream);
 }

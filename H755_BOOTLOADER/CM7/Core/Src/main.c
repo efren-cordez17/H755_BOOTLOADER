@@ -26,6 +26,11 @@
 #include "string.h"
 #include "flash_layout.h"
 #include "app_header.h"
+#include "flash_operations.h"
+#include "bl_log.h"
+#include <stdio.h>
+#include "bl_update.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,6 +40,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+//#define TEST_FLASH_BANK2   /* P3 bench test: uncomment, build, flash, read the log, comment out again */
+//#define TEST_IMAGE_CHECK   /* P5 bench test: same use; writes only bank 2 S6 (backup) */
+//#define TEST_BOOT_FLAGS    /* P6 bench test: same use; writes at most one record into S1 */
+//#define TEST_INSTALL 1     /* P7 bench test: 1 = full install of the running app as version + 1 (rewrites the app area), 2 = wrong CRC in IMAGE_READY (step A must refuse), 3 = seed only: the boot decision installs it (P8) */
+//#define PL_TEST_BOOT_DELAY_MS 3000   /* power-loss tests only: wait before the first log line so the terminal can reconnect. Remove before release */
 
 /* DUAL_CORE_BOOT_SYNC_SEQUENCE: Define for dual core boot synchronization    */
 /*                             demonstration code based on hardware semaphore */
@@ -75,42 +85,247 @@ static void MX_USART3_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-static uint32_t mem_base = OTA_START_ADDR;   // F411: internal OTA slot 0x0800C000 (was 0 in W25Q)
-static uint32_t mem_cursor = 0;
-static uint32_t ota_image_total_size = 16;   // expected OTA Header size
 
-void ota_mem_set_total_size(uint32_t size)
+
+#ifdef TEST_FLASH_BANK2
+/* . Only built when TEST_FLASH_BANK2 is defined. */
+static void test_flash_bank2(void)
 {
-	ota_image_total_size = size;
+    static const uint8_t pattern[FLASH_WORD_BYTES] =
+    {
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xF0, 0x0F,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10
+    };
+    char line[80];
+    uint32_t t0;
+    int err;
+
+
+    /* 1. Guard decisions only: nothing is erased. Expect 0 0 0 1 1 */
+    snprintf(line, sizeof(line), "T3 allow B1S0=%d B1S6=%d B1S7=%d BKP=%d RX=%d\r\n",
+             flash_erase_allowed(FLASH_BANK_1, BL_SECTOR, 1),
+             flash_erase_allowed(FLASH_BANK_1, FLASH_SECTOR_6, 1),
+             flash_erase_allowed(FLASH_BANK_1, ARQ_CFG_SECTOR, 1),
+             flash_erase_allowed(BKP_BANK, BKP_SECTOR, BKP_NB_SECTORS),
+             flash_erase_allowed(RX_BANK, RX_SECTOR, RX_NB_SECTORS));
+    bl_print(line);
+
+    /* 2. Guard wired into the erase. Flash stays LOCKED here, so even a broken guard erases nothing. */
+    err = flash_erase_sectors(FLASH_BANK_1, ARQ_CFG_SECTOR, 1);
+    snprintf(line, sizeof(line), "T3 erase B1S7 locked: %d (expect -32)\r\n", err);
+    bl_print(line);
+
+    /* 3. Bank 2 sector 7: erase, write one flash word, read it back */
+    HAL_FLASH_Unlock();
+    t0  = HAL_GetTick();
+    err = flash_erase_rx();
+    snprintf(line, sizeof(line), "T3 erase B2S7: %d, %lu ms, hal 0x%08lX\r\n",
+             err, (unsigned long)(HAL_GetTick() - t0), (unsigned long)flash_last_hal_error());
+    bl_print(line);
+    if (err == 0)
+        err = flash_write_flashword(RX_START_ADDR, pattern);
+    HAL_FLASH_Lock();
+
+    bl_print((err == 0 && memcmp((const void *)RX_START_ADDR, pattern, sizeof(pattern)) == 0)
+             ? "T3 write+read B2S7: OK\r\n" : "T3 write+read B2S7: FAIL\r\n");
+}
+#endif
+
+#ifdef TEST_IMAGE_CHECK
+/* . Only built when TEST_IMAGE_CHECK is defined.
+   Writes only bank 2 S6 (backup). Never the app, the S1 header sector or the OTA slot. */
+#include "bl_image.h"
+#include "board_cfg.h"
+#include "crc32.h"
+
+#define T5_PAYLOAD  1024U
+static uint8_t t5_img[IMG_HDR_SIZE + T5_PAYLOAD] __attribute__((aligned(32)));   // test image in RAM
+
+/* Builds a fresh RAM image every call (1 KB payload), changes one thing, runs image_check on it. */
+static int t5_ram_image(uint32_t magic, uint32_t size, uint32_t hw_rev, int flip_bit)
+{
+    ota_image_hdr_t *h = (ota_image_hdr_t *)t5_img;
+    uint8_t *payload   = t5_img + IMG_HDR_SIZE;
+
+    for (uint32_t i = 0; i < T5_PAYLOAD; i++)
+        payload[i] = (uint8_t)(i * 7U + 3U);
+    h->magic       = magic;
+    h->version     = 1;
+    h->image_size  = size;
+    h->crc         = crc32(payload, T5_PAYLOAD);
+    h->hw_rev      = hw_rev;
+    h->reserved[0] = h->reserved[1] = h->reserved[2] = 0xFFFFFFFF;
+    if (flip_bit)
+        payload[100] ^= 0x01;                    // one bit flipped after the CRC was taken
+    return image_check((uint32_t)t5_img);
 }
 
-int ota_read_mem(uint8_t *buf, uint32_t len)
+static void test_image_check(void)
 {
-	if (mem_cursor + len > ota_image_total_size)
-		return -1;
+    const uint32_t rx_payload = RX_START_ADDR + IMG_HDR_SIZE;
+    ota_image_hdr_t h;
+    uint32_t t0, t_off, t_on, crc_off, crc_on;
+    int rc, r_crc, r_overlap, r_size, r_still;
 
-	uint8_t *flash_ptr = (uint8_t *)(mem_base + mem_cursor);   // F411: internal flash is memory-mapped
-	memcpy(buf, flash_ptr, len);                               // F411: was W25Q_FastRead(mem_base + mem_cursor, buf, len)
+    /* 1. image_check on RAM images, no flash access. Expect 0 -10 -11 -11 -12 -13 */
+    bl_logf("T5 check good=%d magic=%d size0=%d big=%d hwrev=%d crc=%d\r\n",
+            t5_ram_image(APP_MAGIC, T5_PAYLOAD, BOARD_HW_REV, 0),
+            t5_ram_image(0x12345678U, T5_PAYLOAD, BOARD_HW_REV, 0),
+            t5_ram_image(APP_MAGIC, 0, BOARD_HW_REV, 0),
+            t5_ram_image(APP_MAGIC, IMG_MAX_PAYLOAD + 1U, BOARD_HW_REV, 0),
+            t5_ram_image(APP_MAGIC, T5_PAYLOAD, BOARD_HW_REV + 1U, 0),
+            t5_ram_image(APP_MAGIC, T5_PAYLOAD, BOARD_HW_REV, 1));
 
-	mem_cursor += len;
-	return 0;
+    /* 2. Time one full-size CRC pass: 131,040 bytes of bank 2 S7, whatever they hold */
+    t0      = HAL_GetTick();
+    crc_off = crc32((const uint8_t *)rx_payload, IMG_MAX_PAYLOAD);
+    t_off   = HAL_GetTick() - t0;
+    SCB_EnableICache();
+    t0      = HAL_GetTick();
+    crc_on  = crc32((const uint8_t *)rx_payload, IMG_MAX_PAYLOAD);
+    t_on    = HAL_GetTick() - t0;
+    SCB_DisableICache();                         // back to how the bootloader runs today
+    bl_logf("T5 crc 128K: %lu ms I-cache off, %lu ms on, same=%d\r\n",
+            (unsigned long)t_off, (unsigned long)t_on, crc_off == crc_on);
+
+    /* 3. Worst-case copy: those 131,040 bytes into the backup (erase + write + read-back). Expect 0 */
+    h.magic       = APP_MAGIC;
+    h.version     = 0;
+    h.image_size  = IMG_MAX_PAYLOAD;
+    h.crc         = crc_off;
+    h.hw_rev      = BOARD_HW_REV;
+    h.reserved[0] = h.reserved[1] = h.reserved[2] = 0xFFFFFFFF;
+    t0 = HAL_GetTick();
+    rc = copy_image(&h, rx_payload, &region_backup, crc_off);
+    bl_logf("T5 copy 128K S7->BKP: %d %s, %lu ms, hal 0x%08lX\r\n", rc, bl_err_text(rc),
+            (unsigned long)(HAL_GetTick() - t0), (unsigned long)flash_last_hal_error());
+
+    /* 4. Refusals: each returns before the erase, so the backup from step 3 stays good.
+          Expect -14 -33 -11, then 0 */
+    r_crc     = copy_image(&h, rx_payload, &region_backup, crc_off ^ 1U);              // wrong expected CRC
+    r_overlap = copy_image(&h, BKP_START_ADDR + IMG_HDR_SIZE, &region_backup, crc_off); // source inside dst
+    h.image_size = 0;
+    r_size    = copy_image(&h, rx_payload, &region_backup, crc_off);                    // size 0
+    r_still   = image_check(BKP_START_ADDR);
+    bl_logf("T5 refuse crc=%d overlap=%d size0=%d, backup still=%d\r\n", r_crc, r_overlap, r_size, r_still);
+
+    /* 5. The real backup step (Part 7 step B): running app -> backup. Expect 0 */
+    if (bootloader_is_app_valid() == 0)
+    {
+        make_backup_header(&h);
+        t0 = HAL_GetTick();
+        rc = copy_image(&h, APP_START_ADDR, &region_backup, h.crc);
+        bl_logf("T5 backup app v%lu, %lu bytes: %d %s, %lu ms\r\n", (unsigned long)h.version,
+                (unsigned long)h.image_size, rc, bl_err_text(rc), (unsigned long)(HAL_GetTick() - t0));
+    }
+    else
+        bl_print("T5 backup: no valid app, skipped\r\n");
+
+    /* 6. Leave the backup empty. Expect 0, then -10 (erased magic) */
+    HAL_FLASH_Unlock();
+    rc = flash_erase_backup();
+    HAL_FLASH_Lock();
+    r_still = image_check(BKP_START_ADDR);
+    bl_logf("T5 erase BKP: %d, backup now=%d\r\n", rc, r_still);
+}
+#endif
+
+#ifdef TEST_BOOT_FLAGS
+/* . Only built when TEST_BOOT_FLAGS is defined.
+   Writes at most one record into S1, and only when the log has no valid record. Never erases. */
+#include "boot_flags.h"
+
+static void t6_print_log(void)
+{
+    boot_flag_rec_t last;
+    uint32_t next_free, count, bad;
+    int rc = flags_read_last(&last, &next_free, &count, &bad);
+
+    bl_logf("T6 log: %d, %s, %lu valid, %lu bad, next 0x%08lX\r\n", rc, bl_state_text(last.state),
+            (unsigned long)count, (unsigned long)bad, (unsigned long)next_free);
+    bl_logf("T6 last: crc 0x%08lX, v%lu, detail %ld\r\n", (unsigned long)last.img_crc,
+            (unsigned long)last.img_version, (long)last.detail);
 }
 
-static void bl_print(const char *msg)
+static void test_boot_flags(void)
 {
-    uint16_t len = (uint16_t)strlen(msg);
+    uint32_t count, t0;
+    int rc;
 
-    HAL_UART_Transmit(&huart8, (uint8_t *)msg, len, 200);
-    HAL_UART_Transmit(&huart3, (uint8_t *)msg, len, 200);
-    HAL_UART_Transmit(&huart3, (uint8_t *)"^^", 2, 50);
+    /* 1. The log as it is now. After a reset or a power-off this must show the record from the first run */
+    t6_print_log();
+
+    /* 2. Only on a log with no valid record: add IMAGE_READY with test values, then read the log again */
+    flags_read_last(NULL, NULL, &count, NULL);
+    if (count == 0)
+    {
+        t0 = HAL_GetTick();
+        rc = flags_append(FLAG_STATE_IMAGE_READY, 0x12345678U, 2U, 0);
+        bl_logf("T6 append IMAGE_READY: %d %s, %lu ms\r\n", rc, bl_err_text(rc), (unsigned long)(HAL_GetTick() - t0));
+        t6_print_log();
+    }
+
+    /* 3. An invalid state is refused before anything is written. Expect -21 */
+    rc = flags_append(9U, 0, 0, 0);
+    bl_logf("T6 append state 9: %d %s\r\n", rc, bl_err_text(rc));
 }
+#endif
 
-/*
-static int ota_slot_has_image(void)
+#ifdef TEST_INSTALL
+/* Only built when TEST_INSTALL is defined (1 or 2).
+   On an empty flag log with a valid app: S7 = copy of the running app labelled version + 1, then IMAGE_READY.
+   Then it runs the install sequence, as Part 8 will in the real boot.
+   Mode 1 rewrites the app area (same code, new version number). Mode 2 puts a wrong CRC into
+   IMAGE_READY: step A must refuse it, and the app, slot and backup must stay as they were. */
+#include "boot_flags.h"
+#include "bl_image.h"
+#include "bl_update.h"
+#include "bl_errors.h"
+
+static const flash_region_t t7_region_rx = { RX_START_ADDR, RX_BANK, RX_SECTOR, RX_NB_SECTORS };
+
+static void test_install(void)
 {
-    return ((const ota_image_hdr_t *)OTA_START_ADDR)->magic == APP_MAGIC;
+    boot_flag_rec_t last;
+    uint32_t count;
+    ota_image_hdr_t h;
+    int rc;
+
+    flags_read_last(&last, NULL, &count, NULL);
+    bl_logf("T7 flags: %s, %lu valid\r\n", bl_state_text(last.state), (unsigned long)count);
+
+    /* 1. Seed, only on an empty log with a valid running app */
+    if (count == 0 && bootloader_is_app_valid() == 0)
+    {
+        make_backup_header(&h);
+        h.version += 1U;                                           // same code, next version number
+        rc = copy_image(&h, APP_START_ADDR, &t7_region_rx, h.crc);
+        bl_logf("T7 seed S7: v%lu %luB: %d %s\r\n", (unsigned long)h.version,
+                (unsigned long)h.image_size, rc, bl_err_text(rc));
+        if (rc == BL_OK)
+        {
+			#if TEST_INSTALL == 2
+            rc = flags_append(FLAG_STATE_IMAGE_READY, h.crc ^ 1U, h.version, 0);   // wrong CRC on purpose
+
+            #else
+            rc = flags_append(FLAG_STATE_IMAGE_READY, h.crc, h.version, 0);
+
+            #endif
+            bl_logf("T7 seed IMAGE_READY: %d %s\r\n", rc, bl_err_text(rc));
+        }
+        flags_read_last(&last, NULL, &count, NULL);
+    }
+
+	#if TEST_INSTALL != 3
+    /* 2. Resume from the last record, as Part 8 will do in every boot */
+    rc = bl_update_resume(&last);
+    flags_read_last(&last, NULL, &count, NULL);
+    bl_logf("T7 resume: %d %s, flags now %s, %lu valid\r\n", rc, bl_err_text(rc),
+            bl_state_text(last.state), (unsigned long)count);
+	#endif
+
 }
-*/
+#endif
 
 /* USER CODE END 0 */
 
@@ -182,92 +397,45 @@ Error_Handler();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
   HAL_Delay(100);
-    // W25Q_Reset();                                  // F411: remove
+  #ifdef PL_TEST_BOOT_DELAY_MS
+    HAL_Delay(PL_TEST_BOOT_DELAY_MS);   /* test only: time to reconnect the terminal */
+  #endif
+      // W25Q_Reset();                                  // F411: remove
 
-  /* H755 */
+    /* H755 */
 
-  bl_print("Inside Bootloader!!\r\n");
+    bl_print("Inside Bootloader!!\r\n");
 
-  //HAL_UART_Transmit(&huart8, (uint8_t *)"Inside Bootloader!!\r\n", 21, 100);
+    /* TESTS */
+    #ifdef TEST_FLASH_BANK2
+  	  test_flash_bank2();
+    #endif
 
-  int ota_flag_set = (check_ota_request() == 0);
+    #ifdef TEST_IMAGE_CHECK
+  	  test_image_check();
+    #endif
+
+    #ifdef TEST_BOOT_FLAGS
+  	  test_boot_flags();
+    #endif
+
+    #ifdef TEST_INSTALL
+  	  test_install();
+    #endif
 
 
-
-  if (ota_flag_set ||
-         (bootloader_is_app_valid() != 0 && bl_ota_check_slot() == 0))
-    {
-	  bl_print(ota_flag_set ? "OTA Requested... Flashing..\r\n"
-	                        : "App invalid, slot valid: reinstalling..\r\n");
-    	//HAL_UART_Transmit(&huart8, (uint8_t *)"OTA Requested... Flashing..\r\n", 29, 100);
-
-        ota_stream_t stream =
-        {
-            .read = ota_read_mem,
-            .set_total_size = ota_mem_set_total_size
-        };
-
-        bl_ota_ctx_t ctx;
-
-        int ota_stat = bl_ota_run(&ctx, &stream);
-
-        if (ota_stat != 0)
-        {
-			bl_print("OTA Failed!! \r\n");
-			switch (ota_stat)                                    /* Fix B: name the cause */
-			{
-			case -2: bl_print("SLOT MAGIC ERROR!!\r\n"); break;
-			case -3: bl_print("SLOT SIZE ERROR!!\r\n");  break;
-			case -7: bl_print("SLOT CRC ERROR!! Application not erased\r\n"); break;
-			case -5: bl_print("FLASH WRITE ERROR!!\r\n"); break;
-			case -6: bl_print("COPY CHECK ERROR!!\r\n");  break;
-			default: bl_print("SLOT READ ERROR!!\r\n");   break;   /* -1, -4 */
-			}
-			while (1)
-			{
-			}
-		}
-        else
-        {
-        	//HAL_UART_Transmit(&huart8, (uint8_t *)"OTA Flashed Successfully, Jumping to app...\r\n", 45, 100);
-        	bl_print("OTA Flashed Successfully, Jumping to app...\r\n");
-            //HAL_UART_Transmit(&huart2, (uint8_t *)"OTA Flashed Successfully, Jumping to app...\r\n", 45, 100);
-        }
-    }
-
-    int err = bootloader_is_app_valid();
+    /* Boot decision: flags, resume, Fix A fallback and app check, all in bl_update.c */
+    int err = bl_boot_decide();
     if (err != 0)
     {
-    	bl_print("Failed to Jump!! \r\n");
-        //HAL_UART_Transmit(&huart2, (uint8_t *)"Failed to Jump!! ", 17, 100);
-        switch (err){
-        case 1:
-        	bl_print("MAGIC ERROR!!\r\n");
-            //HAL_UART_Transmit(&huart2, (uint8_t *)"MAGIC ERROR!!\r\n", 15, 100);
-            break;
-        case 2:
-            bl_print("RESET ERROR!!\r\n");
-        	//HAL_UART_Transmit(&huart2, (uint8_t *)"RESET ERROR!!\r\n", 15, 100);
-            break;
-        case 3:
-        	bl_print("SIZE ERROR!!\r\n");
-            //HAL_UART_Transmit(&huart2, (uint8_t *)"SIZE ERROR!!\r\n", 14, 100);
-            break;
-        case 4:
-        	bl_print("CRC ERROR!!\r\n");
-            //HAL_UART_Transmit(&huart2, (uint8_t *)"CRC ERROR!!\r\n", 13, 100);
-            break;
-        default:
-        	bl_print("ERROR!!\r\n");
-            //HAL_UART_Transmit(&huart2, (uint8_t *)"ERROR!!\r\n", 9, 100);
-            break;
-        }
+        bl_logf("Failed to Jump!! %d %s\r\n", err, bl_err_text(err));
         while (1)
         {
         }
     }
 
-
+    bl_logf("JUMP v%lu, %lu ms after reset\r\n",
+            (unsigned long)((const app_header_t *)APP_HEADER_ADDR)->version, (unsigned long)HAL_GetTick());
     JumpToApplication();
 
   /* USER CODE END 2 */

@@ -9,44 +9,83 @@
 #include "flash_operations.h"
 #include "flash_layout.h"
 #include "string.h"
+#include "bl_errors.h"
 
-static void flash_clear_errors(void)
+static uint32_t last_hal_error = 0;       // HAL_FLASH_GetError() at the last failure
+
+uint32_t flash_last_hal_error(void)
 {
-    __HAL_FLASH_CLEAR_FLAG_BANK1(FLASH_FLAG_ALL_ERRORS_BANK1);
+    return last_hal_error;
 }
 
-static uint32_t flash_erase_sectors(uint32_t first, uint32_t count)
+static void flash_clear_errors(uint32_t bank)
+{
+    if (bank == FLASH_BANK_2)
+        __HAL_FLASH_CLEAR_FLAG_BANK2(FLASH_FLAG_ALL_ERRORS_BANK2);
+    else
+        __HAL_FLASH_CLEAR_FLAG_BANK1(FLASH_FLAG_ALL_ERRORS_BANK1);
+}
+
+/* Erase guard. Bank 1: only S1-S5 (header, app, slot); never S0 bootloader, S6 spare, S7 ArQ config.
+   Bank 2: only the backup (S6) or the receive area (S7), one sector at a time. Anything else is refused. */
+int flash_erase_allowed(uint32_t bank, uint32_t first, uint32_t count)
+{
+    if (count == 0 || first > FLASH_SECTOR_7 || count > 8U - first)
+        return 0;                                          // empty range or past the end of the bank
+
+    uint32_t last = first + count - 1;
+
+    if (bank == FLASH_BANK_1)
+        return (first != BL_SECTOR) && (last < OTA_FIRST_SECTOR + OTA_NB_SECTORS);   // S1..S5
+    if (bank == FLASH_BANK_2)
+        return ((first == BKP_SECTOR) && (count == BKP_NB_SECTORS)) ||
+               ((first == RX_SECTOR)  && (count == RX_NB_SECTORS));
+
+    return 0;                                              // FLASH_BANK_BOTH or an unknown value
+}
+
+int flash_erase_sectors(uint32_t bank, uint32_t first, uint32_t count)
 {
     FLASH_EraseInitTypeDef erase;
-    uint32_t error = 0;
+    uint32_t sector_error = 0;
 
-    flash_clear_errors();
+    if (!flash_erase_allowed(bank, first, count))
+        return BL_ERR_ERASE_REFUSED;                       // -32: nothing erased
+
+    flash_clear_errors(bank);
     erase.TypeErase    = FLASH_TYPEERASE_SECTORS;
-    erase.Banks        = FLASH_BANK_1;
+    erase.Banks        = bank;
     erase.Sector       = first;
     erase.NbSectors    = count;
     erase.VoltageRange = FLASH_VOLTAGE_RANGE_3;
 
-    HAL_FLASHEx_Erase(&erase, &error);
-    return error;                              // 0xFFFFFFFF = success
+    if (HAL_FLASHEx_Erase(&erase, &sector_error) != HAL_OK)
+    {
+        last_hal_error = HAL_FLASH_GetError();
+        return BL_ERR_ERASE;                               // -30
+    }
+    return BL_OK;
 }
 
-uint32_t flash_erase_app(void)    { return flash_erase_sectors(APP_FIRST_SECTOR, APP_NB_SECTORS); }
-uint32_t flash_erase_ota(void)    { return flash_erase_sectors(OTA_FIRST_SECTOR, OTA_NB_SECTORS); }
-uint32_t flash_erase_header(void) { return flash_erase_sectors(APP_HEADER_SECTOR, 1); }
 
-uint32_t flash_read_ota_flag(void)
-{
-    return *(__IO uint32_t *)APP_HEADER_ADDR;
-}
+int flash_erase_header(void) { return flash_erase_sectors(HDR_BANK, APP_HEADER_SECTOR, 1); }
+int flash_erase_app(void)    { return flash_erase_sectors(APP_BANK, APP_FIRST_SECTOR, APP_NB_SECTORS); }
+int flash_erase_ota(void)    { return flash_erase_sectors(OTA_BANK, OTA_FIRST_SECTOR, OTA_NB_SECTORS); }
+int flash_erase_backup(void) { return flash_erase_sectors(BKP_BANK, BKP_SECTOR, BKP_NB_SECTORS); }
+int flash_erase_rx(void)     { return flash_erase_sectors(RX_BANK, RX_SECTOR, RX_NB_SECTORS); }
 
-/* addr must be a multiple of 32. Writes exactly 32 bytes. */
+
+/* addr must be a multiple of 32. Writes exactly 32 bytes. HAL picks the bank from addr. */
 int flash_write_flashword(uint32_t addr, const uint8_t *data32)
 {
     uint32_t word[8];
     memcpy(word, data32, FLASH_WORD_BYTES);
+    flash_clear_errors(addr >= FLASH_BANK2_BASE ? FLASH_BANK_2 : FLASH_BANK_1);
     if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_FLASHWORD, addr, (uint32_t)word) != HAL_OK)
+    {
+        last_hal_error = HAL_FLASH_GetError();
         return -1;
+    }
     return 0;
 }
 

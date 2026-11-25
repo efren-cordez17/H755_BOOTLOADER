@@ -10,7 +10,6 @@
 
 #include "app_header.h"
 
-int check_ota_request (void);
 
 typedef struct
 {
@@ -21,15 +20,7 @@ typedef struct
     uint32_t running_crc;      /* CRC accumulator */
 } bl_ota_ctx_t;
 
-/*
-typedef struct
-{
-    uint32_t magic;        // OTA image magic
-    uint32_t image_size;   // Application binary size ONLY
-    uint32_t crc;          // CRC32 of application binary ONLY
-    uint32_t version;      // Firmware version
-} ota_image_hdr_t;
-*/
+
 
 
 typedef struct
@@ -39,7 +30,8 @@ typedef struct
 } ota_stream_t;
 
 int bl_ota_run(bl_ota_ctx_t *ctx, ota_stream_t *stream);
-int bl_ota_check_slot(void);   /* 0 = complete image in the slot; -2 magic, -3 size, -7 CRC */
-void bl_flash_write_app_header(uint32_t magic, uint32_t size, uint32_t crc, uint32_t version);
+int bl_ota_install_from_slot(void);   /* resets the slot reader, then bl_ota_run(); same return codes */
+int bl_ota_check_slot(void);   /* 0 = good image in the slot; -10 magic, -11 size, -12 hw_rev, -13 CRC */
+int bl_flash_write_app_header(uint32_t magic, uint32_t size, uint32_t crc, uint32_t version);
 
 #endif /* INC_BL_OTA_H_ */
